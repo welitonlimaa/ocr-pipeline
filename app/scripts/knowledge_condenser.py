@@ -5,67 +5,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.cluster import KMeans
 
-
-STOPWORDS_PT = list(
-    set(
-        [
-            "a",
-            "o",
-            "e",
-            "de",
-            "do",
-            "da",
-            "em",
-            "um",
-            "uma",
-            "para",
-            "com",
-            "não",
-            "no",
-            "na",
-            "os",
-            "as",
-            "por",
-            "se",
-            "que",
-            "como",
-            "mais",
-            "ou",
-            "mas",
-            "foi",
-            "ao",
-            "à",
-            "dos",
-            "das",
-            "já",
-            "ser",
-            "tem",
-            "também",
-            "só",
-            "pelo",
-            "pela",
-            "até",
-            "isso",
-            "sua",
-            "seu",
-            "são",
-            "era",
-            "entre",
-            "quando",
-            "muito",
-            "há",
-            "nos",
-            "nas",
-            "eles",
-            "elas",
-        ]
-    )
-)
-
-
-def simple_sentence_split(text: str):
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    return sentences
+from app.utils.simple_sentence_split import simple_sentence_split
+from app.utils.stopwords import STOPWORDS_PT
 
 
 class KnowledgeCondenser:

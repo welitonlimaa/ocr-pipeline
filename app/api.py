@@ -10,12 +10,17 @@ Endpoints:
   GET  /health            - Health check
 """
 
+import pdfplumber
+from io import BytesIO
 from typing import Optional
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from app.scripts.job_state import registry, JobStatus
 from app.scripts.storage import storage
 from app.config.settings import settings
+from app.utils.check_rate_limit import RateLimitExceeded, check_rate_limit
+from app.utils.get_client_ip import get_client_ip
+from app.core.redis import redis_client
 
 
 try:
@@ -89,6 +94,7 @@ def health():
 
 @app.post("/jobs/submit", status_code=202)
 async def submit_pdf(
+    request: Request,
     file: UploadFile = File(..., description="Arquivo PDF para processamento"),
     chunk_size: Optional[int] = Form(
         None, description="Páginas por chunk (padrão: config)"
@@ -105,15 +111,46 @@ async def submit_pdf(
 
     Retorna `job_id` e localização dos resultados futuros.
     """
-    if not file.filename.lower().endswith(".pdf"):
+
+    client_ip = get_client_ip(request)
+
+    try:
+        check_rate_limit(redis_client, client_ip)
+    except RateLimitExceeded:
+        raise HTTPException(
+            status_code=429, detail="Limite de requisições diárias atingido"
+        )
+
+    MAX_PAGES = 150
+
+    if (
+        not file.filename.lower().endswith(".pdf")
+        or file.content_type != "application/pdf"
+    ):
         raise HTTPException(400, "Apenas arquivos PDF são aceitos")
 
     pdf_bytes = await file.read()
+
     size_mb = len(pdf_bytes) / (1024 * 1024)
     if size_mb > settings.max_file_size_mb:
         raise HTTPException(
             413,
             f"Arquivo muito grande: {size_mb:.1f}MB (máximo: {settings.max_file_size_mb}MB)",
+        )
+
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            total_pages = len(pdf.pages)
+    except Exception:
+        raise HTTPException(400, "PDF inválido ou corrompido")
+
+    if total_pages == 0:
+        raise HTTPException(400, "PDF sem páginas")
+
+    if total_pages > MAX_PAGES:
+        raise HTTPException(
+            400,
+            f"PDF excede o limite de {MAX_PAGES} páginas (recebido: {total_pages})",
         )
 
     metadata = {

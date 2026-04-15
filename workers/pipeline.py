@@ -23,6 +23,7 @@ from app.scripts.extractor import (
 from app.scripts.storage import storage
 from app.scripts.job_state import registry, JobStatus
 from app.scripts.knowledge_condenser import KnowledgeCondenser
+from app.utils.compute_text_stats import compute_text_stats
 
 
 logger = get_task_logger(__name__)
@@ -206,9 +207,19 @@ def finalize_document(
         )
 
         condensed_text = condenser.condense(md_texts)
+        stats = compute_text_stats(condensed_text)
 
-        condensed_key = f"jobs/{job_id}/condensed.md"
-        condensed_url = storage.upload_text(condensed_key, condensed_text)
+        condensed_metadata = {
+            "job_id": job_id,
+            "tokens_estimate": stats["tokens_estimate"],
+            "word_count": stats["word_count"],
+        }
+
+        condensed_json_key = f"jobs/{job_id}/condensed.json"
+        condensed_json_url = storage.upload_json(condensed_json_key, condensed_metadata)
+
+        condensed_md_key = f"jobs/{job_id}/condensed.md"
+        condensed_md_url = storage.upload_text(condensed_md_key, condensed_text)
 
         index = {
             "job_id": job_id,
@@ -234,8 +245,10 @@ def finalize_document(
                 "total_estimated_tokens": total_tokens,
             },
             "condensed_context": {
-                "key": condensed_key,
-                "url": condensed_url,
+                "md_key": condensed_md_key,
+                "md_url": condensed_md_url,
+                "json_key": condensed_json_key,
+                "json_url": condensed_json_url,
                 "strategy": "tfidf_lsa_textrank",
             },
         }
