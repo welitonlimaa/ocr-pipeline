@@ -54,6 +54,18 @@ class JobState:
             progress_pct=pct,
         )
 
+    def increment_progress_chunks(self):
+        current = self._r.incr(f"job:{self.job_id}:processed_chunks")
+
+        total = self.get().get("total_chunks", 1)
+
+        pct = min(round((current / total) * 100, 1), 99.0)
+
+        self.set(
+            processed_chunks=current,
+            progress_pct=pct,
+        )
+
     def add_chunk_result(self, chunk_index: int, result: dict):
         """Registra resultado de um chunk processado."""
         key = f"job:{self.job_id}:chunk:{chunk_index}"
@@ -96,7 +108,9 @@ class JobRegistry:
             message="Job criado, aguardando processamento",
             progress_pct=0,
             progress_pages=0,
+            processed_chunks=0,
             total_pages=0,
+            total_chunks=0,
             created_at=datetime.utcnow().isoformat(),
             updated_at=datetime.utcnow().isoformat(),
             metadata=metadata or {},

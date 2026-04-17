@@ -15,6 +15,7 @@ from io import BytesIO
 from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from app.scripts.job_state import registry, JobStatus
 from app.scripts.storage import storage
 from app.config.settings import settings
@@ -34,6 +35,18 @@ app = FastAPI(
     title="OCR Pipeline API",
     description="Pipeline desacoplado de OCR para PDFs grandes com MinIO + Redis + Celery",
     version="1.0.0",
+)
+
+allow_origins = settings.CORS_ORIGINS
+
+allow_credentials = False if allow_origins == ["*"] else True
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -121,8 +134,6 @@ async def submit_pdf(
             status_code=429, detail="Limite de requisições diárias atingido"
         )
 
-    MAX_PAGES = 150
-
     if (
         not file.filename.lower().endswith(".pdf")
         or file.content_type != "application/pdf"
@@ -147,10 +158,10 @@ async def submit_pdf(
     if total_pages == 0:
         raise HTTPException(400, "PDF sem páginas")
 
-    if total_pages > MAX_PAGES:
+    if total_pages > settings.MAX_PAGES:
         raise HTTPException(
             400,
-            f"PDF excede o limite de {MAX_PAGES} páginas (recebido: {total_pages})",
+            f"PDF excede o limite de {settings.MAX_PAGES} páginas (recebido: {total_pages})",
         )
 
     metadata = {

@@ -24,6 +24,7 @@ from app.scripts.storage import storage
 from app.scripts.job_state import registry, JobStatus
 from app.scripts.knowledge_condenser import KnowledgeCondenser
 from app.utils.compute_text_stats import compute_text_stats
+from app.utils.create_zip_from_keys import create_zip_from_keys
 
 
 logger = get_task_logger(__name__)
@@ -72,6 +73,7 @@ def process_document(self, job_id: str, pdf_object_key: str):
         state.set(
             total_pages=total_pages,
             total_chunks=total_chunks,
+            processed_chunks=0,
         )
         state.set_status(
             JobStatus.EXTRACTING,
@@ -157,7 +159,8 @@ def extract_chunk_task(
         }
         if state:
             state.add_chunk_result(chunk_index, chunk_summary)
-            state.set_progress(result.end_page, end_page)
+            state.increment_progress_chunks()
+            # state.set_progress(result.end_page, end_page)
 
         logger.info(f"[{job_id}] Chunk {chunk_index} concluído em {elapsed}s")
         return chunk_summary
@@ -176,10 +179,6 @@ def extract_chunk_task(
 def finalize_document(
     chunk_results: list[dict], job_id: str, total_pages: int, total_chunks: int
 ):
-    """
-    Chamado após todos os chunks serem processados (callback do chord).
-    Cria índice consolidado e atualiza estado final do job.
-    """
     state = registry.get(job_id)
 
     try:
@@ -256,11 +255,37 @@ def finalize_document(
         index_key = f"jobs/{job_id}/index.json"
         index_url = storage.upload_json(index_key, index)
 
+        state.set_status(JobStatus.INDEXING, "Gerando pacote final (ZIP)...")
+
+        files_to_zip = []
+
+        for c in successful:
+            files_to_zip.append(c["markdown_key"])
+            files_to_zip.append(c["json_key"])
+
+        files_to_zip.extend(
+            [
+                condensed_md_key,
+                condensed_json_key,
+                index_key,
+            ]
+        )
+
+        zip_key, zip_url = create_zip_from_keys(job_id, storage, files_to_zip)
+
+        index["zip"] = {
+            "key": zip_key,
+            "url": zip_url,
+        }
+
+        storage.upload_json(index_key, index)
+
         state.set(
             status=JobStatus.COMPLETED.value,
             message=f"Processamento concluído: {len(successful)}/{total_chunks} chunks",
             progress_pct=100,
             progress_pages=total_pages,
+            processed_chunks=total_chunks,
             outputs={
                 "index_key": index_key,
                 "index_url": index_url,
@@ -269,6 +294,8 @@ def finalize_document(
                 "chunks_failed": len(failed),
                 "total_tokens_estimate": total_tokens,
                 "total_tables": total_tables,
+                "zip_key": zip_key,
+                "zip_url": zip_url,
             },
         )
 
