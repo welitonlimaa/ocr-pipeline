@@ -1,6 +1,6 @@
 """
 Teste de integração local do pipeline OCR.
-Simula o fluxo completo sem Docker: MinIO local + Redis + pipeline direto.
+Simula o fluxo completo sem Docker: S3 local + Redis + pipeline direto.
 
 Uso:
     python tests/test_pipeline.py
@@ -242,15 +242,15 @@ def test_full_pipeline():
         # PDF mínimo válido
         pdf_bytes = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\nxref\n0 4\n0000000000 65535 f\n0000000009 00000 n\n0000000058 00000 n\n0000000115 00000 n\ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF"
 
-    # Upload para MinIO
-    print("\n[2/6] Fazendo upload para MinIO...")
+    # Upload para S3
+    print("\n[2/6] Fazendo upload para S3...")
     test_pdf_key = "test/pipeline-test.pdf"
     try:
         storage.upload_bytes(test_pdf_key, pdf_bytes, "application/pdf")
-        print(f"      Armazenado em: minio://{settings.minio_bucket}/{test_pdf_key}")
+        print(f"      Armazenado em: S3://{settings.S3_bucket}/{test_pdf_key}")
     except Exception as e:
         print(f"      ERRO: {e}")
-        print("      Certifique-se que o MinIO está rodando: docker-compose up minio")
+        print("      Certifique-se que o S3 está rodando: docker-compose up S3")
         return
 
     # Cria job no Redis
@@ -285,7 +285,7 @@ def test_full_pipeline():
         return
 
     # Verifica outputs
-    print("\n[5/6] Verificando outputs no MinIO...")
+    print("\n[5/6] Verificando outputs no S3...")
     objects = storage.list_objects(f"jobs/{job_id}/")
     print(f"      Objetos criados: {len(objects)}")
     for obj in sorted(objects):

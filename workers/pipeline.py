@@ -104,7 +104,7 @@ def extract_chunk_task(
 ) -> dict:
     """
     Extrai texto e tabelas de um chunk de páginas.
-    Salva resultado no MinIO e registra progresso no Redis.
+    Salva resultado no S3 e registra progresso no Redis.
     """
     state = registry.get(job_id)
 

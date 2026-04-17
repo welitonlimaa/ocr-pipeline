@@ -3,7 +3,7 @@ API FastAPI: ponto de entrada síncrono para disparar o pipeline OCR.
 
 Endpoints:
   POST /jobs/submit       - Envia PDF e inicia processamento (síncrono no upload, async no OCR)
-  POST /jobs/submit-url   - Submete PDF por URL ou caminho no MinIO
+  POST /jobs/submit-url   - Submete PDF por URL ou caminho no S3
   GET  /jobs/{job_id}     - Status do job em tempo real
   GET  /jobs/{job_id}/index - Índice completo com chaves de output
   GET  /jobs/{job_id}/chunks/{chunk_index} - Resultado de um chunk específico
@@ -33,7 +33,7 @@ except Exception:
 
 app = FastAPI(
     title="OCR Pipeline API",
-    description="Pipeline desacoplado de OCR para PDFs grandes com MinIO + Redis + Celery",
+    description="Pipeline desacoplado de OCR para PDFs grandes com S3 + Redis + Celery",
     version="1.0.0",
 )
 
@@ -82,7 +82,7 @@ def _dispatch_pipeline(job_id: str, pdf_key: str):
 def health():
     """Health check do serviço."""
     redis_ok = False
-    minio_ok = False
+    s3_ok = False
 
     try:
         r = registry.get_redis()
@@ -92,15 +92,15 @@ def health():
         pass
 
     try:
-        storage.client.list_buckets()
-        minio_ok = True
+        storage.client.head_bucket(Bucket=settings.S3_bucket)
+        s3_ok = True
     except Exception:
         pass
 
     return {
-        "status": "ok" if (redis_ok and minio_ok) else "degraded",
+        "status": "ok" if (redis_ok and s3_ok) else "degraded",
         "redis": "ok" if redis_ok else "error",
-        "minio": "ok" if minio_ok else "error",
+        "s3": "ok" if s3_ok else "error",
         "celery": "ok" if CELERY_AVAILABLE else "unavailable (modo local)",
     }
 
@@ -119,7 +119,7 @@ async def submit_pdf(
     """
     Submete um PDF para processamento OCR.
 
-    **Síncrono**: faz upload do PDF para o MinIO e registra o job.
+    **Síncrono**: faz upload do PDF para o S3 e registra o job.
     **Assíncrono**: dispara o pipeline de extração em background via Celery.
 
     Retorna `job_id` e localização dos resultados futuros.
@@ -208,7 +208,7 @@ async def submit_pdf(
             "tracking": {
                 "status_url": f"/jobs/{job_id}",
                 "index_url": f"/jobs/{job_id}/index",
-                "storage_path": f"minio://{settings.minio_bucket}/jobs/{job_id}/",
+                "storage_path": f"s3://{settings.S3_bucket}/jobs/{job_id}/",
             },
             "metadata": metadata,
         },
@@ -216,17 +216,17 @@ async def submit_pdf(
 
 
 @app.post("/jobs/submit-key", status_code=202)
-async def submit_by_minio_key(
+async def submit_by_s3_key(
     pdf_key: str,
     filename: str = "document.pdf",
     tags: Optional[str] = None,
 ):
     """
-    Submete PDF já existente no MinIO para processamento.
+    Submete PDF já existente no S3 para processamento.
     Útil para integrar com outros pipelines que já fazem upload.
     """
     if not storage.object_exists(pdf_key):
-        raise HTTPException(404, f"Objeto não encontrado no MinIO: {pdf_key}")
+        raise HTTPException(404, f"Objeto não encontrado no S3: {pdf_key}")
 
     state = registry.create(
         filename=filename,
@@ -243,7 +243,7 @@ async def submit_by_minio_key(
         content={
             "job_id": job_id,
             "status": "queued",
-            "message": "Job enfileirado para PDF existente no MinIO.",
+            "message": "Job enfileirado para PDF existente no S3.",
             "tracking": {"status_url": f"/jobs/{job_id}"},
         },
     )
@@ -263,7 +263,7 @@ def get_job_index(job_id: str):
     """
     Retorna índice completo do documento processado.
     Disponível apenas quando o job está COMPLETED.
-    Contém todas as chaves MinIO dos chunks extraídos, prontas para uso em LLM.
+    Contém todas as chaves S3 dos chunks extraídos, prontas para uso em LLM.
     """
     state = registry.get(job_id)
     if not state:
