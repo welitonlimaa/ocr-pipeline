@@ -28,4 +28,4 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    command: celery -A workers.pipeline worker --loglevel=info --concurrency=4
+    command: celery -A workers.pipeline worker --loglevel=info --concurrency=2
