@@ -51,20 +51,20 @@ def validate_pdf(
         )
         raise HTTPException(400, "Apenas arquivos PDF são aceitos")
 
-    if size_mb > settings.max_file_size_mb:
+    if size_mb > settings.MAX_FILE_SIZE_MB:
         logger.warning(
             "Arquivo rejeitado: tamanho excede limite",
             extra={
                 "action": "file_too_large",
                 "size_mb": round(size_mb, 2),
-                "limit_mb": settings.max_file_size_mb,
+                "limit_mb": settings.MAX_FILE_SIZE_MB,
                 "file_name": file.filename,
                 "client_ip": client_ip,
             },
         )
         raise HTTPException(
             413,
-            f"Arquivo muito grande: {size_mb:.1f}MB (máximo: {settings.max_file_size_mb}MB)",
+            f"Arquivo muito grande: {size_mb:.1f}MB (máximo: {settings.MAX_FILE_SIZE_MB}MB)",
         )
 
     try:

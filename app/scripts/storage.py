@@ -13,18 +13,18 @@ logger = get_logger(__name__)
 class StorageClient:
     def __init__(self):
         kwargs = dict(
-            aws_access_key_id=settings.S3_access_key,
-            aws_secret_access_key=settings.S3_secret_key,
-            region_name=settings.S3_region,
+            aws_access_key_id=settings.S3_ACCESS_KEY,
+            aws_secret_access_key=settings.S3_SECRET_KEY,
+            region_name=settings.S3_REGION,
             config=Config(signature_version="s3v4"),
         )
 
-        if settings.S3_endpoint:
-            scheme = "https" if settings.S3_secure else "http"
-            kwargs["endpoint_url"] = f"{scheme}://{settings.S3_endpoint}"
+        if settings.S3_ENDPOINT:
+            scheme = "https" if settings.S3_SECURE else "http"
+            kwargs["endpoint_url"] = f"{scheme}://{settings.S3_ENDPOINT}"
 
         self.client = boto3.client("s3", **kwargs)
-        self.bucket = settings.S3_bucket
+        self.bucket = settings.S3_BUCKET
         self._ensure_bucket()
 
     def _ensure_bucket(self):
@@ -43,13 +43,13 @@ class StorageClient:
                     extra={
                         "action": "bucket_creating",
                         "bucket": self.bucket,
-                        "region": settings.S3_region,
+                        "region": settings.S3_REGION,
                     },
                 )
                 create_kwargs = {"Bucket": self.bucket}
-                if settings.S3_region and settings.S3_region != "us-east-1":
+                if settings.S3_REGION and settings.S3_REGION != "us-east-1":
                     create_kwargs["CreateBucketConfiguration"] = {
-                        "LocationConstraint": settings.S3_region
+                        "LocationConstraint": settings.S3_REGION
                     }
                 self.client.create_bucket(**create_kwargs)
                 logger.info(

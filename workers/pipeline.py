@@ -47,7 +47,7 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
-    result_expires=settings.redis_job_ttl,
+    result_expires=settings.REDIS_JOB_TTL,
 )
 
 
@@ -119,7 +119,7 @@ def process_document(self, job_id: str, pdf_object_key: str):
                 "action": "chunks_dispatched",
                 "total_pages": total_pages,
                 "total_chunks": total_chunks,
-                "chunk_size_pages": settings.chunk_size_pages,
+                "CHUNK_SIZE_PAGES": settings.CHUNK_SIZE_PAGES,
             },
         )
 

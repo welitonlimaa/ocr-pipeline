@@ -48,7 +48,7 @@ def _check_redis() -> bool:
 
 def _check_s3() -> bool:
     try:
-        storage.client.head_bucket(Bucket=settings.S3_bucket)
+        storage.client.head_bucket(Bucket=settings.S3_BUCKET)
         return True
     except Exception as exc:
         logger.error(

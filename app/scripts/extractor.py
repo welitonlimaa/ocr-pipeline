@@ -326,7 +326,7 @@ def compute_chunks(total_pages: int, chunk_size: int = None) -> list[tuple[int, 
     Retorna lista de (start_page, end_page) 0-indexed para cada chunk.
     chunk_size padrão vem das configurações.
     """
-    size = chunk_size or settings.chunk_size_pages
+    size = chunk_size or settings.CHUNK_SIZE_PAGES
     chunks = []
     for start in range(0, total_pages, size):
         end = min(start + size - 1, total_pages - 1)

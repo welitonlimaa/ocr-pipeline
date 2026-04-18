@@ -247,7 +247,7 @@ def test_full_pipeline():
     test_pdf_key = "test/pipeline-test.pdf"
     try:
         storage.upload_bytes(test_pdf_key, pdf_bytes, "application/pdf")
-        print(f"      Armazenado em: S3://{settings.S3_bucket}/{test_pdf_key}")
+        print(f"      Armazenado em: S3://{settings.S3_BUCKET}/{test_pdf_key}")
     except Exception as e:
         print(f"      ERRO: {e}")
         print("      Certifique-se que o S3 está rodando: docker-compose up S3")

@@ -53,7 +53,7 @@ async def submit_pdf(
         tracking=TrackingInfo(
             status_url=f"/jobs/{result.job_id}",
             index_url=f"/jobs/{result.job_id}/index",
-            storage_path=f"s3://{settings.S3_bucket}/jobs/{result.job_id}/",
+            storage_path=f"s3://{settings.S3_BUCKET}/jobs/{result.job_id}/",
         ),
         metadata=result.metadata,
     )

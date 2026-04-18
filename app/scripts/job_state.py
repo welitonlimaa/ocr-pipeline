@@ -38,7 +38,7 @@ class JobState:
             current["updated_at"] = datetime.utcnow().isoformat()
             self._r.setex(
                 self._key,
-                settings.redis_job_ttl,
+                settings.REDIS_JOB_TTL,
                 json.dumps(current, ensure_ascii=False),
             )
         except redis.RedisError as exc:
@@ -114,11 +114,11 @@ class JobState:
         try:
             self._r.setex(
                 chunk_key,
-                settings.redis_job_ttl,
+                settings.REDIS_JOB_TTL,
                 json.dumps(result, ensure_ascii=False),
             )
             self._r.rpush(done_key, chunk_index)
-            self._r.expire(done_key, settings.redis_job_ttl)
+            self._r.expire(done_key, settings.REDIS_JOB_TTL)
         except redis.RedisError as exc:
             logger.error(
                 "Falha ao registrar resultado de chunk no Redis",
@@ -190,18 +190,18 @@ class JobRegistry:
 
     def __init__(self):
         try:
-            self._r = redis.from_url(settings.redis_url, decode_responses=True)
+            self._r = redis.from_url(settings.REDIS_URL, decode_responses=True)
             self._r.ping()
             logger.info(
                 "Conexão com Redis estabelecida",
-                extra={"action": "redis_connected", "url": settings.redis_url},
+                extra={"action": "redis_connected", "url": settings.REDIS_URL},
             )
         except redis.RedisError as exc:
             logger.critical(
                 "Falha ao conectar ao Redis na inicialização",
                 extra={
                     "action": "redis_connect_failed",
-                    "url": settings.redis_url,
+                    "url": settings.REDIS_URL,
                     "error": str(exc),
                 },
                 exc_info=True,
