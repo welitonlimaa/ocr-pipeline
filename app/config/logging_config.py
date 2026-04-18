@@ -1,14 +1,3 @@
-"""
-Logging estruturado para produção.
-
-Configura formatação JSON para ingestão por agregadores (CloudWatch, Datadog, Loki, etc.)
-e fallback legível para desenvolvimento.
-
-Uso:
-    from app.core.logging_config import get_logger
-    logger = get_logger(__name__)
-"""
-
 import logging
 import sys
 import os
@@ -47,7 +36,7 @@ class JSONFormatter(logging.Formatter):
             ).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "status_message": record.getMessage(),
             "service": self.SERVICE_NAME,
             "env": self.ENV,
         }

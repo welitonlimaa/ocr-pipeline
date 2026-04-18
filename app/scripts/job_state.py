@@ -1,8 +1,3 @@
-"""
-Gerenciamento de estado dos jobs via Redis.
-Cada job tem um estado rastreado em tempo real com progresso por página.
-"""
-
 import json
 import uuid
 from datetime import datetime
@@ -69,7 +64,7 @@ class JobState:
                 "job_id": self.job_id,
                 "status_from": prev,
                 "status_to": status.value,
-                "message": message,
+                "status_message": message,
             },
         )
 
@@ -249,7 +244,7 @@ class JobRegistry:
             extra={
                 "action": "job_registered",
                 "job_id": job_id,
-                "filename": filename,
+                "file_name": filename,
             },
         )
         return state

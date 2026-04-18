@@ -2,8 +2,8 @@
 Workers Celery: pipeline desacoplado de processamento OCR.
 
 Fluxo:
-  1. process_document (task principal) →
-  2. extract_chunk (por chunk, em paralelo) →
+  1. process_document (task principal)
+  2. extract_chunk (por chunk, em paralelo)
   3. finalize_document (após todos os chunks)
 
 Cada task atualiza o estado do job no Redis em tempo real.
@@ -29,7 +29,7 @@ from app.config.logging_config import get_logger
 
 
 logger = get_logger(__name__)
-# logger Celery separado para que task_id/retries apareçam automaticamente
+
 _celery_logger = get_task_logger(__name__)
 
 celery_app = Celery(
@@ -52,7 +52,7 @@ celery_app.conf.update(
 
 
 # ---------------------------------------------------------------------------
-# Helpers de log estruturado
+# Helpers de log
 # ---------------------------------------------------------------------------
 
 

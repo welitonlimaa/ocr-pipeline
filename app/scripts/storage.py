@@ -1,8 +1,3 @@
-"""
-Storage layer: AWS S3 via boto3.
-Gerencia upload/download de PDFs, resultados de OCR e chunks extraídos.
-"""
-
 import json
 import time
 from app.config.settings import settings

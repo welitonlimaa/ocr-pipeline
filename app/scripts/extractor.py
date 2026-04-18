@@ -1,9 +1,3 @@
-"""
-Engine de extração OCR/texto via markitdown + pdfplumber.
-Processa PDFs em chunks de N páginas, extrai estruturas semânticas
-e formata em markdown otimizado para contexto LLM.
-"""
-
 import io
 import re
 import tempfile
