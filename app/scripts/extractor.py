@@ -7,6 +7,7 @@ e formata em markdown otimizado para contexto LLM.
 import io
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,9 @@ import pdfplumber
 from markitdown import MarkItDown
 
 from app.config.settings import settings
+from app.config.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -53,7 +57,19 @@ class DocumentMeta:
 def _extract_tables_from_page(page: pdfplumber.page.Page) -> list[dict]:
     """Extrai tabelas de uma página e converte para dicionário estruturado."""
     tables = []
-    raw_tables = page.extract_tables()
+    try:
+        raw_tables = page.extract_tables()
+    except Exception as exc:
+        logger.warning(
+            "Falha ao extrair tabelas de página",
+            extra={
+                "action": "table_extraction_failed",
+                "page_num": getattr(page, "page_number", "unknown"),
+                "error": str(exc),
+            },
+        )
+        return []
+
     for idx, table in enumerate(raw_tables):
         if not table or len(table) < 2:
             continue
@@ -134,39 +150,104 @@ def extract_chunk(
     Extrai texto e tabelas de um intervalo de páginas do PDF.
     Usa pdfplumber para extração granular e markitdown como fallback/normalização.
     """
+    ctx = {
+        "chunk_index": chunk_index,
+        "start_page": start_page + 1,
+        "end_page": end_page + 1,
+    }
+
     page_results: list[PageResult] = []
     all_tables: list[dict] = []
+    pages_with_no_text = 0
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page_idx in range(start_page, min(end_page + 1, len(pdf.pages))):
-            page = pdf.pages[page_idx]
-            page_num = page_idx + 1
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page_idx in range(start_page, min(end_page + 1, len(pdf.pages))):
+                page = pdf.pages[page_idx]
+                page_num = page_idx + 1
 
-            raw_text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                try:
+                    raw_text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                except Exception as exc:
+                    logger.warning(
+                        "Falha ao extrair texto de página individual",
+                        extra={
+                            **ctx,
+                            "action": "page_text_extraction_failed",
+                            "page_num": page_num,
+                            "error": str(exc),
+                        },
+                    )
+                    raw_text = ""
 
-            tables = _extract_tables_from_page(page)
-            all_tables.extend(tables)
+                if not raw_text.strip():
+                    pages_with_no_text += 1
 
-            has_images = len(page.images) > 0
+                tables = _extract_tables_from_page(page)
+                all_tables.extend(tables)
 
-            markdown = _page_to_markdown(page_num, raw_text, tables)
-            word_count = len(raw_text.split())
+                has_images = len(page.images) > 0
+                markdown = _page_to_markdown(page_num, raw_text, tables)
+                word_count = len(raw_text.split())
 
-            page_results.append(
-                PageResult(
-                    page_num=page_num,
-                    raw_text=raw_text,
-                    markdown=markdown,
-                    tables=tables,
-                    word_count=word_count,
-                    has_tables=len(tables) > 0,
-                    has_images=has_images,
+                page_results.append(
+                    PageResult(
+                        page_num=page_num,
+                        raw_text=raw_text,
+                        markdown=markdown,
+                        tables=tables,
+                        word_count=word_count,
+                        has_tables=len(tables) > 0,
+                        has_images=has_images,
+                    )
                 )
-            )
 
+    except Exception as exc:
+        logger.error(
+            "Falha ao abrir ou percorrer PDF com pdfplumber",
+            extra={
+                **ctx,
+                "action": "pdfplumber_open_failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            exc_info=True,
+        )
+        raise
+
+    if pages_with_no_text > 0:
+        logger.debug(
+            "Páginas sem texto detectadas no chunk",
+            extra={
+                **ctx,
+                "action": "pages_no_text",
+                "pages_with_no_text": pages_with_no_text,
+                "total_pages_in_chunk": len(page_results),
+            },
+        )
+
+    # Fallback para markitdown se nenhuma página retornou texto
     if all(not p.raw_text.strip() for p in page_results):
+        logger.warning(
+            "Nenhuma página retornou texto via pdfplumber — ativando fallback markitdown",
+            extra={
+                **ctx,
+                "action": "markitdown_fallback_triggered",
+                "pages_in_chunk": len(page_results),
+            },
+        )
+        t_fallback = time.time()
         page_results = _fallback_markitdown(
             pdf_bytes, chunk_index, start_page, end_page
+        )
+        logger.info(
+            "Fallback markitdown concluído",
+            extra={
+                **ctx,
+                "action": "markitdown_fallback_done",
+                "elapsed_seconds": round(time.time() - t_fallback, 2),
+                "pages_recovered": len(page_results),
+            },
         )
 
     markdown_combined = _build_chunk_markdown(chunk_index, page_results)
@@ -192,11 +273,12 @@ def _fallback_markitdown(
 ) -> list[PageResult]:
     """Fallback via markitdown para PDFs que não têm texto extraível."""
     md_converter = MarkItDown()
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
         result = md_converter.convert(tmp_path)
         text = result.text_content or ""
         pages = text.split("\f")
@@ -216,8 +298,23 @@ def _fallback_markitdown(
                 )
             )
         return page_results
+    except Exception as exc:
+        logger.error(
+            "Falha no fallback markitdown",
+            extra={
+                "action": "markitdown_fallback_failed",
+                "chunk_index": chunk_index,
+                "start_page": start_page + 1,
+                "end_page": end_page + 1,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            exc_info=True,
+        )
+        raise
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 def _build_chunk_markdown(chunk_index: int, pages: list[PageResult]) -> str:
@@ -245,5 +342,18 @@ def compute_chunks(total_pages: int, chunk_size: int = None) -> list[tuple[int, 
 
 def get_pdf_page_count(pdf_bytes: bytes) -> int:
     """Retorna número de páginas do PDF."""
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        return len(pdf.pages)
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            count = len(pdf.pages)
+        return count
+    except Exception as exc:
+        logger.error(
+            "Falha ao obter contagem de páginas do PDF",
+            extra={
+                "action": "page_count_failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            exc_info=True,
+        )
+        raise

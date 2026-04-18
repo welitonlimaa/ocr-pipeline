@@ -11,6 +11,7 @@ Endpoints:
 """
 
 import pdfplumber
+import time as _time
 from io import BytesIO
 from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -21,8 +22,11 @@ from app.scripts.storage import storage
 from app.config.settings import settings
 from app.utils.check_rate_limit import RateLimitExceeded, check_rate_limit
 from app.utils.get_client_ip import get_client_ip
-from app.core.redis import redis_client
+from app.config.redis import redis_client
+from app.config.logging_config import get_logger, configure_logging
 
+configure_logging()
+logger = get_logger(__name__)
 
 try:
     from workers.pipeline import process_document
@@ -30,6 +34,10 @@ try:
     CELERY_AVAILABLE = True
 except Exception:
     CELERY_AVAILABLE = False
+    logger.warning(
+        "Celery não disponível — pipeline rodará em modo local (threads)",
+        extra={"action": "celery_unavailable"},
+    )
 
 app = FastAPI(
     title="OCR Pipeline API",
@@ -38,7 +46,6 @@ app = FastAPI(
 )
 
 allow_origins = settings.CORS_ORIGINS
-
 allow_credentials = False if allow_origins == ["*"] else True
 
 app.add_middleware(
@@ -48,6 +55,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Middleware: log de acesso
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    t0 = _time.time()
+    response = await call_next(request)
+    elapsed = round(_time.time() - t0, 3)
+
+    level = logger.warning if response.status_code >= 400 else logger.info
+    level(
+        "HTTP request",
+        extra={
+            "action": "http_request",
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "elapsed_seconds": elapsed,
+            "client_ip": request.client.host if request.client else "unknown",
+        },
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Helpers internos
+# ---------------------------------------------------------------------------
 
 
 def _job_response(job_id: str, state_data: dict) -> dict:
@@ -78,6 +116,11 @@ def _dispatch_pipeline(job_id: str, pdf_key: str):
         t.start()
 
 
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
 @app.get("/health")
 def health():
     """Health check do serviço."""
@@ -88,17 +131,35 @@ def health():
         r = registry.get_redis()
         r.ping()
         redis_ok = True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error(
+            "Health check: Redis indisponível",
+            extra={"action": "health_redis_fail", "error": str(exc)},
+        )
 
     try:
         storage.client.head_bucket(Bucket=settings.S3_bucket)
         s3_ok = True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error(
+            "Health check: S3 indisponível",
+            extra={"action": "health_s3_fail", "error": str(exc)},
+        )
+
+    overall = "ok" if (redis_ok and s3_ok) else "degraded"
+
+    if overall == "degraded":
+        logger.warning(
+            "Health check degraded",
+            extra={
+                "action": "health_degraded",
+                "redis": redis_ok,
+                "s3": s3_ok,
+            },
+        )
 
     return {
-        "status": "ok" if (redis_ok and s3_ok) else "degraded",
+        "status": overall,
         "redis": "ok" if redis_ok else "error",
         "s3": "ok" if s3_ok else "error",
         "celery": "ok" if CELERY_AVAILABLE else "unavailable (modo local)",
@@ -118,18 +179,17 @@ async def submit_pdf(
 ):
     """
     Submete um PDF para processamento OCR.
-
-    **Síncrono**: faz upload do PDF para o S3 e registra o job.
-    **Assíncrono**: dispara o pipeline de extração em background via Celery.
-
-    Retorna `job_id` e localização dos resultados futuros.
+    Síncrono no upload → Assíncrono no pipeline (Celery).
     """
-
     client_ip = get_client_ip(request)
 
     try:
         check_rate_limit(redis_client, client_ip)
     except RateLimitExceeded:
+        logger.warning(
+            "Rate limit excedido",
+            extra={"action": "rate_limit_exceeded", "client_ip": client_ip},
+        )
         raise HTTPException(
             status_code=429, detail="Limite de requisições diárias atingido"
         )
@@ -138,12 +198,31 @@ async def submit_pdf(
         not file.filename.lower().endswith(".pdf")
         or file.content_type != "application/pdf"
     ):
+        logger.warning(
+            "Arquivo rejeitado: não é PDF",
+            extra={
+                "action": "invalid_file_type",
+                "filename": file.filename,
+                "content_type": file.content_type,
+                "client_ip": client_ip,
+            },
+        )
         raise HTTPException(400, "Apenas arquivos PDF são aceitos")
 
     pdf_bytes = await file.read()
-
     size_mb = len(pdf_bytes) / (1024 * 1024)
+
     if size_mb > settings.max_file_size_mb:
+        logger.warning(
+            "Arquivo rejeitado: tamanho excede limite",
+            extra={
+                "action": "file_too_large",
+                "size_mb": round(size_mb, 2),
+                "limit_mb": settings.max_file_size_mb,
+                "filename": file.filename,
+                "client_ip": client_ip,
+            },
+        )
         raise HTTPException(
             413,
             f"Arquivo muito grande: {size_mb:.1f}MB (máximo: {settings.max_file_size_mb}MB)",
@@ -152,13 +231,42 @@ async def submit_pdf(
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages)
-    except Exception:
+    except Exception as exc:
+        logger.error(
+            "PDF inválido ou corrompido ao inspecionar páginas",
+            extra={
+                "action": "pdf_invalid",
+                "filename": file.filename,
+                "size_mb": round(size_mb, 2),
+                "error": str(exc),
+                "client_ip": client_ip,
+            },
+            exc_info=True,
+        )
         raise HTTPException(400, "PDF inválido ou corrompido")
 
     if total_pages == 0:
+        logger.warning(
+            "PDF rejeitado: sem páginas",
+            extra={
+                "action": "pdf_empty",
+                "filename": file.filename,
+                "client_ip": client_ip,
+            },
+        )
         raise HTTPException(400, "PDF sem páginas")
 
     if total_pages > settings.MAX_PAGES:
+        logger.warning(
+            "PDF rejeitado: excede limite de páginas",
+            extra={
+                "action": "pdf_too_many_pages",
+                "total_pages": total_pages,
+                "limit": settings.MAX_PAGES,
+                "filename": file.filename,
+                "client_ip": client_ip,
+            },
+        )
         raise HTTPException(
             400,
             f"PDF excede o limite de {settings.MAX_PAGES} páginas (recebido: {total_pages})",
@@ -175,13 +283,37 @@ async def submit_pdf(
     state = registry.create(filename=file.filename, metadata=metadata)
     job_id = state.get()["job_id"]
 
+    logger.info(
+        "Job criado — iniciando upload para S3",
+        extra={
+            "action": "job_created",
+            "job_id": job_id,
+            "filename": file.filename,
+            "size_mb": round(size_mb, 2),
+            "total_pages": total_pages,
+            "client_ip": client_ip,
+        },
+    )
+
     state.set_status(JobStatus.UPLOADING, "Enviando PDF para storage...")
     pdf_key = f"jobs/{job_id}/input/{file.filename}"
+
     try:
         storage.upload_bytes(pdf_key, pdf_bytes, content_type="application/pdf")
-    except Exception as e:
-        state.set_status(JobStatus.FAILED, f"Falha no upload: {str(e)}")
-        raise HTTPException(500, f"Erro ao armazenar PDF: {str(e)}")
+    except Exception as exc:
+        logger.error(
+            "Falha no upload do PDF para o S3",
+            extra={
+                "action": "s3_upload_failed",
+                "job_id": job_id,
+                "pdf_key": pdf_key,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            exc_info=True,
+        )
+        state.set_status(JobStatus.FAILED, f"Falha no upload: {str(exc)}")
+        raise HTTPException(500, f"Erro ao armazenar PDF: {str(exc)}")
 
     state.set(
         pdf_key=pdf_key,
@@ -191,6 +323,14 @@ async def submit_pdf(
 
     if CELERY_AVAILABLE:
         process_document.delay(job_id, pdf_key)
+        logger.info(
+            "Task Celery despachada",
+            extra={
+                "action": "celery_task_dispatched",
+                "job_id": job_id,
+                "pdf_key": pdf_key,
+            },
+        )
     else:
         import threading
         from workers.pipeline import _run_pipeline_local
@@ -198,6 +338,10 @@ async def submit_pdf(
         threading.Thread(
             target=_run_pipeline_local, args=(job_id, pdf_key), daemon=True
         ).start()
+        logger.info(
+            "Pipeline iniciado em modo local (thread)",
+            extra={"action": "local_thread_started", "job_id": job_id},
+        )
 
     return JSONResponse(
         status_code=202,
@@ -226,6 +370,10 @@ async def submit_by_s3_key(
     Útil para integrar com outros pipelines que já fazem upload.
     """
     if not storage.object_exists(pdf_key):
+        logger.warning(
+            "Submit por chave S3: objeto não encontrado",
+            extra={"action": "s3_key_not_found", "pdf_key": pdf_key},
+        )
         raise HTTPException(404, f"Objeto não encontrado no S3: {pdf_key}")
 
     state = registry.create(
@@ -237,6 +385,10 @@ async def submit_by_s3_key(
 
     if CELERY_AVAILABLE:
         process_document.delay(job_id, pdf_key)
+        logger.info(
+            "Job enfileirado via chave S3",
+            extra={"action": "job_queued_by_key", "job_id": job_id, "pdf_key": pdf_key},
+        )
 
     return JSONResponse(
         status_code=202,
@@ -254,6 +406,10 @@ def get_job_status(job_id: str):
     """Retorna estado atual do job com progresso em tempo real."""
     state = registry.get(job_id)
     if not state:
+        logger.warning(
+            "Consulta de status para job inexistente",
+            extra={"action": "job_not_found", "job_id": job_id},
+        )
         raise HTTPException(404, f"Job {job_id} não encontrado")
     return _job_response(job_id, state.get())
 
@@ -263,10 +419,13 @@ def get_job_index(job_id: str):
     """
     Retorna índice completo do documento processado.
     Disponível apenas quando o job está COMPLETED.
-    Contém todas as chaves S3 dos chunks extraídos, prontas para uso em LLM.
     """
     state = registry.get(job_id)
     if not state:
+        logger.warning(
+            "Consulta de índice para job inexistente",
+            extra={"action": "job_index_not_found", "job_id": job_id},
+        )
         raise HTTPException(404, f"Job {job_id} não encontrado")
 
     data = state.get()
@@ -285,6 +444,10 @@ def get_job_index(job_id: str):
     index_key = outputs.get("index_key")
 
     if not index_key:
+        logger.error(
+            "Índice ausente nos outputs de job concluído",
+            extra={"action": "index_key_missing", "job_id": job_id, "outputs": outputs},
+        )
         raise HTTPException(500, "Índice não encontrado nos outputs do job")
 
     try:
@@ -293,8 +456,19 @@ def get_job_index(job_id: str):
             chunk["markdown_url"] = storage.get_presigned_url(chunk["markdown_key"])
             chunk["json_url"] = storage.get_presigned_url(chunk["json_key"])
         return index
-    except Exception as e:
-        raise HTTPException(500, f"Erro ao recuperar índice: {str(e)}")
+    except Exception as exc:
+        logger.error(
+            "Falha ao recuperar índice do S3",
+            extra={
+                "action": "index_download_failed",
+                "job_id": job_id,
+                "index_key": index_key,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            exc_info=True,
+        )
+        raise HTTPException(500, f"Erro ao recuperar índice: {str(exc)}")
 
 
 @app.get("/jobs/{job_id}/chunks/{chunk_index}")
@@ -306,6 +480,14 @@ def get_chunk(job_id: str, chunk_index: int):
 
     chunk = state.get_chunk(chunk_index)
     if not chunk:
+        logger.warning(
+            "Chunk consultado ainda não disponível",
+            extra={
+                "action": "chunk_not_ready",
+                "job_id": job_id,
+                "chunk_index": chunk_index,
+            },
+        )
         raise HTTPException(
             404, f"Chunk {chunk_index} não encontrado ou ainda não processado"
         )
@@ -339,5 +521,17 @@ def get_chunk_content(job_id: str, chunk_index: int):
             "tokens_estimate": chunk.get("tokens_estimate", 0),
             "content": markdown,
         }
-    except Exception as e:
-        raise HTTPException(500, f"Erro ao recuperar conteúdo: {str(e)}")
+    except Exception as exc:
+        logger.error(
+            "Falha ao recuperar conteúdo do chunk",
+            extra={
+                "action": "chunk_content_download_failed",
+                "job_id": job_id,
+                "chunk_index": chunk_index,
+                "markdown_key": chunk.get("markdown_key"),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            exc_info=True,
+        )
+        raise HTTPException(500, f"Erro ao recuperar conteúdo: {str(exc)}")

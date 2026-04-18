@@ -25,9 +25,12 @@ from app.scripts.job_state import registry, JobStatus
 from app.scripts.knowledge_condenser import KnowledgeCondenser
 from app.utils.compute_text_stats import compute_text_stats
 from app.utils.create_zip_from_keys import create_zip_from_keys
+from app.config.logging_config import get_logger
 
 
-logger = get_task_logger(__name__)
+logger = get_logger(__name__)
+# logger Celery separado para que task_id/retries apareçam automaticamente
+_celery_logger = get_task_logger(__name__)
 
 celery_app = Celery(
     "ocr_pipeline",
@@ -48,28 +51,78 @@ celery_app.conf.update(
 )
 
 
+# ---------------------------------------------------------------------------
+# Helpers de log estruturado
+# ---------------------------------------------------------------------------
+
+
+def _job_ctx(job_id: str, **extra) -> dict:
+    """Monta dicionário de contexto base para logs de job."""
+    return {"job_id": job_id, **extra}
+
+
+def _chunk_ctx(job_id: str, chunk_index: int, **extra) -> dict:
+    """Monta dicionário de contexto base para logs de chunk."""
+    return {"job_id": job_id, "chunk_index": chunk_index, **extra}
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+
+
 @celery_app.task(bind=True, name="pipeline.process_document", max_retries=2)
 def process_document(self, job_id: str, pdf_object_key: str):
     """
     Task principal: orquestra o pipeline completo para um PDF.
     Divide em chunks e dispara processamento paralelo.
     """
+    ctx = _job_ctx(job_id, pdf_key=pdf_object_key, celery_task_id=self.request.id)
+
     state = registry.get(job_id)
     if not state:
-        logger.error(f"Job {job_id} não encontrado no Redis")
+        logger.error(
+            "Job não encontrado no Redis — descartando task",
+            extra={**ctx, "action": "job_not_found"},
+        )
         return
 
     try:
+        logger.info(
+            "Iniciando download do PDF do storage",
+            extra={**ctx, "action": "pdf_download_start"},
+        )
         state.set_status(JobStatus.PROCESSING, "Baixando PDF do storage...")
-        logger.info(f"[{job_id}] Baixando {pdf_object_key}")
+        t_download = time.time()
         pdf_bytes = storage.download_bytes(pdf_object_key)
+        download_elapsed = round(time.time() - t_download, 2)
+
+        logger.info(
+            "PDF baixado com sucesso",
+            extra={
+                **ctx,
+                "action": "pdf_download_ok",
+                "size_bytes": len(pdf_bytes),
+                "elapsed_seconds": download_elapsed,
+            },
+        )
 
         state.set_status(JobStatus.PROCESSING, "Analisando estrutura do PDF...")
         total_pages = get_pdf_page_count(pdf_bytes)
         chunks = compute_chunks(total_pages)
         total_chunks = len(chunks)
 
-        logger.info(f"[{job_id}] {total_pages} páginas → {total_chunks} chunks")
+        logger.info(
+            "Estrutura do PDF analisada — disparando chunks",
+            extra={
+                **ctx,
+                "action": "chunks_dispatched",
+                "total_pages": total_pages,
+                "total_chunks": total_chunks,
+                "chunk_size_pages": settings.chunk_size_pages,
+            },
+        )
+
         state.set(
             total_pages=total_pages,
             total_chunks=total_chunks,
@@ -88,7 +141,19 @@ def process_document(self, job_id: str, pdf_object_key: str):
         chord(chord_tasks)(callback)
 
     except Exception as exc:
-        logger.exception(f"[{job_id}] Erro no processo principal")
+        retry_count = self.request.retries
+        logger.error(
+            "Falha na orquestração do pipeline — agendando retry",
+            extra={
+                **ctx,
+                "action": "pipeline_failed",
+                "retry_attempt": retry_count,
+                "max_retries": self.max_retries,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            exc_info=True,
+        )
         state.set_status(JobStatus.FAILED, f"Erro: {str(exc)}")
         raise self.retry(exc=exc, countdown=10)
 
@@ -106,11 +171,19 @@ def extract_chunk_task(
     Extrai texto e tabelas de um chunk de páginas.
     Salva resultado no S3 e registra progresso no Redis.
     """
+    ctx = _chunk_ctx(
+        job_id,
+        chunk_index,
+        start_page=start_page + 1,
+        end_page=end_page + 1,
+        celery_task_id=self.request.id,
+    )
     state = registry.get(job_id)
 
     try:
         logger.info(
-            f"[{job_id}] Chunk {chunk_index}: páginas {start_page+1}–{end_page+1}"
+            "Iniciando extração de chunk",
+            extra={**ctx, "action": "chunk_start"},
         )
 
         pdf_bytes = storage.download_bytes(pdf_object_key)
@@ -119,9 +192,22 @@ def extract_chunk_task(
         result: ChunkResult = extract_chunk(
             pdf_bytes, chunk_index, start_page, end_page
         )
-        elapsed = round(time.time() - t0, 2)
+        extraction_elapsed = round(time.time() - t0, 2)
+
+        logger.debug(
+            "Extração concluída — iniciando upload para S3",
+            extra={
+                **ctx,
+                "action": "chunk_extracted",
+                "elapsed_seconds": extraction_elapsed,
+                "tokens_estimate": result.summary_tokens_estimate,
+                "tables_found": len(result.tables_combined),
+                "pages_in_chunk": len(result.pages),
+            },
+        )
 
         md_key = f"jobs/{job_id}/chunks/chunk_{chunk_index:04d}.md"
+        t_upload = time.time()
         storage.upload_text(md_key, result.markdown_combined)
 
         structured = {
@@ -145,6 +231,7 @@ def extract_chunk_task(
         }
         json_key = f"jobs/{job_id}/chunks/chunk_{chunk_index:04d}.json"
         storage.upload_json(json_key, structured)
+        upload_elapsed = round(time.time() - t_upload, 2)
 
         chunk_summary = {
             "chunk_index": chunk_index,
@@ -154,24 +241,67 @@ def extract_chunk_task(
             "json_key": json_key,
             "tokens_estimate": result.summary_tokens_estimate,
             "tables_count": len(result.tables_combined),
-            "elapsed_seconds": elapsed,
+            "elapsed_seconds": extraction_elapsed,
             "status": "done",
         }
+
         if state:
             state.add_chunk_result(chunk_index, chunk_summary)
             state.increment_progress_chunks()
-            # state.set_progress(result.end_page, end_page)
+        else:
+            logger.warning(
+                "Estado do job ausente ao finalizar chunk — progresso não atualizado",
+                extra={**ctx, "action": "chunk_state_missing"},
+            )
 
-        logger.info(f"[{job_id}] Chunk {chunk_index} concluído em {elapsed}s")
+        logger.info(
+            "Chunk processado com sucesso",
+            extra={
+                **ctx,
+                "action": "chunk_done",
+                "extraction_elapsed_seconds": extraction_elapsed,
+                "upload_elapsed_seconds": upload_elapsed,
+                "tokens_estimate": result.summary_tokens_estimate,
+                "tables_count": len(result.tables_combined),
+                "md_key": md_key,
+            },
+        )
         return chunk_summary
 
     except Exception as exc:
-        logger.exception(f"[{job_id}] Erro no chunk {chunk_index}")
+        retry_count = self.request.retries
+        will_retry = retry_count < self.max_retries
+
+        logger.error(
+            "Falha na extração do chunk",
+            extra={
+                **ctx,
+                "action": "chunk_failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "retry_attempt": retry_count,
+                "max_retries": self.max_retries,
+                "will_retry": will_retry,
+            },
+            exc_info=True,
+        )
+
         if state:
             state.add_chunk_result(
                 chunk_index,
                 {"chunk_index": chunk_index, "status": "error", "error": str(exc)},
             )
+
+        if not will_retry:
+            logger.critical(
+                "Chunk esgotou todas as tentativas — marcado como falho definitivamente",
+                extra={
+                    **ctx,
+                    "action": "chunk_exhausted_retries",
+                    "error_type": type(exc).__name__,
+                },
+            )
+
         raise self.retry(exc=exc, countdown=5, max_retries=3)
 
 
@@ -179,34 +309,76 @@ def extract_chunk_task(
 def finalize_document(
     chunk_results: list[dict], job_id: str, total_pages: int, total_chunks: int
 ):
+    ctx = _job_ctx(job_id, total_pages=total_pages, total_chunks=total_chunks)
     state = registry.get(job_id)
 
     try:
-        logger.info(f"[{job_id}] Finalizando — {len(chunk_results)} chunks recebidos")
-        state.set_status(JobStatus.INDEXING, "Consolidando índice do documento...")
-
         successful = [c for c in chunk_results if c and c.get("status") == "done"]
         failed = [c for c in chunk_results if not c or c.get("status") == "error"]
+
+        logger.info(
+            "Iniciando finalização do documento",
+            extra={
+                **ctx,
+                "action": "finalize_start",
+                "chunks_received": len(chunk_results),
+                "chunks_ok": len(successful),
+                "chunks_failed": len(failed),
+            },
+        )
+
+        if failed:
+            logger.warning(
+                "Chunks com falha detectados na finalização",
+                extra={
+                    **ctx,
+                    "action": "finalize_partial_failure",
+                    "failed_chunk_indexes": [c.get("chunk_index") for c in failed if c],
+                    "chunks_failed": len(failed),
+                },
+            )
+
+        state.set_status(JobStatus.INDEXING, "Consolidando índice do documento...")
 
         total_tokens = sum(c.get("tokens_estimate", 0) for c in successful)
         total_tables = sum(c.get("tables_count", 0) for c in successful)
 
+        # --- Condensação de conhecimento ---
         state.set_status(JobStatus.INDEXING, "Condensando conhecimento global...")
 
         md_texts = []
-
         for c in sorted(successful, key=lambda x: x.get("chunk_index", 0)):
             md_key = c["markdown_key"]
             text = storage.download_text(md_key)
             md_texts.append(text)
 
-        condenser = KnowledgeCondenser(
-            n_topics=10,
-            sentences_per_topic=8,
+        logger.debug(
+            "Textos markdown carregados — iniciando condensação",
+            extra={
+                **ctx,
+                "action": "condense_start",
+                "chunks_to_condense": len(md_texts),
+                "total_tokens_estimate": total_tokens,
+            },
         )
 
+        t_condense = time.time()
+        condenser = KnowledgeCondenser(n_topics=10, sentences_per_topic=8)
         condensed_text = condenser.condense(md_texts)
+        condense_elapsed = round(time.time() - t_condense, 2)
+
         stats = compute_text_stats(condensed_text)
+
+        logger.info(
+            "Condensação concluída",
+            extra={
+                **ctx,
+                "action": "condense_done",
+                "elapsed_seconds": condense_elapsed,
+                "condensed_word_count": stats.get("word_count"),
+                "condensed_tokens_estimate": stats.get("tokens_estimate"),
+            },
+        )
 
         condensed_metadata = {
             "job_id": job_id,
@@ -220,6 +392,7 @@ def finalize_document(
         condensed_md_key = f"jobs/{job_id}/condensed.md"
         condensed_md_url = storage.upload_text(condensed_md_key, condensed_text)
 
+        # --- Índice principal ---
         index = {
             "job_id": job_id,
             "total_pages": total_pages,
@@ -255,29 +428,36 @@ def finalize_document(
         index_key = f"jobs/{job_id}/index.json"
         index_url = storage.upload_json(index_key, index)
 
+        logger.debug(
+            "Índice principal gerado",
+            extra={**ctx, "action": "index_uploaded", "index_key": index_key},
+        )
+
+        # --- ZIP final ---
         state.set_status(JobStatus.INDEXING, "Gerando pacote final (ZIP)...")
 
         files_to_zip = []
-
         for c in successful:
             files_to_zip.append(c["markdown_key"])
             files_to_zip.append(c["json_key"])
+        files_to_zip.extend([condensed_md_key, condensed_json_key, index_key])
 
-        files_to_zip.extend(
-            [
-                condensed_md_key,
-                condensed_json_key,
-                index_key,
-            ]
+        t_zip = time.time()
+        zip_key, zip_url = create_zip_from_keys(job_id, storage, files_to_zip)
+        zip_elapsed = round(time.time() - t_zip, 2)
+
+        logger.debug(
+            "ZIP gerado",
+            extra={
+                **ctx,
+                "action": "zip_created",
+                "zip_key": zip_key,
+                "files_zipped": len(files_to_zip),
+                "elapsed_seconds": zip_elapsed,
+            },
         )
 
-        zip_key, zip_url = create_zip_from_keys(job_id, storage, files_to_zip)
-
-        index["zip"] = {
-            "key": zip_key,
-            "url": zip_url,
-        }
-
+        index["zip"] = {"key": zip_key, "url": zip_url}
         storage.upload_json(index_key, index)
 
         state.set(
@@ -299,11 +479,33 @@ def finalize_document(
             },
         )
 
-        logger.info(f"[{job_id}] Pipeline concluído. Tokens estimados: {total_tokens}")
+        logger.info(
+            "Pipeline concluído com sucesso",
+            extra={
+                **ctx,
+                "action": "pipeline_completed",
+                "chunks_ok": len(successful),
+                "chunks_failed": len(failed),
+                "total_tokens_estimate": total_tokens,
+                "total_tables": total_tables,
+                "index_key": index_key,
+                "zip_key": zip_key,
+            },
+        )
         return {"job_id": job_id, "index_key": index_key, "status": "completed"}
 
     except Exception as exc:
-        logger.exception(f"[{job_id}] Erro na finalização")
+        logger.critical(
+            "Falha crítica na finalização do pipeline",
+            extra={
+                **ctx,
+                "action": "finalize_failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "chunks_ok": len(successful) if "successful" in dir() else "unknown",
+            },
+            exc_info=True,
+        )
         if state:
             state.set_status(JobStatus.FAILED, f"Erro na finalização: {str(exc)}")
         raise
