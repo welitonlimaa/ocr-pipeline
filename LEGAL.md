@@ -169,7 +169,7 @@ Caso o usuário utilize o output com ferramentas de IA:
 
 ---
 
-# 📬 14. Contato
+# 📬 13. Contato
 
 Para dúvidas sobre privacidade, segurança ou uso de dados:
 
