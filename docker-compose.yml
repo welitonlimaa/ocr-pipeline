@@ -6,6 +6,7 @@ services:
     ports:
       - "6379:6379"
     command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: always
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -17,6 +18,7 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
+    restart: always
     depends_on:
       redis:
         condition: service_healthy
@@ -25,6 +27,7 @@ services:
   worker:
     build: .
     env_file: .env
+    restart: always
     depends_on:
       redis:
         condition: service_healthy
